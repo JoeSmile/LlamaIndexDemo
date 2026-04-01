@@ -26,7 +26,7 @@ pip install -r requirements.txt
 DASHSCOPE_API_KEY=your_key_here
 ```
 
-可选配置：
+可选配置（建议直接拷贝 `.env.dev.example` / `.env.prod.example`）：
 
 ```env
 RAG_INGEST_ROOT=/abs/path/to/your/docs_root
@@ -36,6 +36,17 @@ RAG_MAX_FILE_MB=0
 RAG_RESOLVE_SYMLINKS=0
 RAG_RETRY_TIMES=3
 RAG_BATCH_SIZE=4
+RAG_EMBED_BATCH_SIZE=10
+RAG_QUERY_TOP_K=5
+RAG_CHAT_TOP_K=5
+RAG_QUERY_SHOW_SOURCES=1
+RAG_QUERY_MAX_SOURCE_NODES=5
+RAG_QUERY_SOURCE_MAX_CHARS=2000
+RAG_QUERY_FULL_OUTPUT=0
+RAG_XLSX_MAX_SHEETS=20
+RAG_XLSX_MAX_ROWS_PER_SHEET=2000
+RAG_XLSX_MAX_COLS=50
+RAG_XLSX_MAX_CELL_CHARS=300
 ```
 
 ### 1.3 运行命令
@@ -43,7 +54,9 @@ RAG_BATCH_SIZE=4
 ```bash
 python llama.py ingest <file_or_dir> [more_paths...]
 python llama.py query "你的问题"
+python llama.py query --full "你的问题（完整来源输出）"
 python llama.py chat
+python llama.py chat --full
 ```
 
 ---
@@ -176,22 +189,60 @@ python llama.py chat
 
 ---
 
-## 3.6 多格式读取与切分策略
+## 3.6 多格式读取、版本兼容与切分策略
 
-不同文档类型采用不同 reader + splitter（`rag/file_handlers.py`）：
+不同文档类型采用不同 reader + splitter（`rag/file_handlers.py`），并带有兼容与降级逻辑：
 
 - `.txt`: `SentenceSplitter(1024, overlap=200)`
 - `.md`: `MarkdownNodeParser + SentenceSplitter`
 - `.docx`: `SemanticSplitterNodeParser(embed_model=...)`
 - `.pdf`: `SentenceSplitter(1536, overlap=256)`
-- `.xlsx`: `TokenTextSplitter(512, overlap=64)`
+- `.xlsx`: `TokenTextSplitter(1200, overlap=120)`（已调整为更稳的粒度）
 - `.pptx`: `SentenceSplitter(2048, overlap=300)`
+
+兼容细节：
+
+- `CleanText` 在不同 `llama-index` 版本可能不存在，代码会自动降级继续运行
+- `DocxReader/PDFReader/ExcelReader/PptxReader` 采用动态探测导入，避免版本差异导致启动失败
+- `ChromaVectorStore` 优先走 `aadd`，若版本无异步接口自动回退 `add`
+
+---
+
+## 3.7 xlsx 改造（重点）
+
+近期对 xlsx 做了稳定性改造，核心目标是避免“卡死 / 内存暴涨 / 输出被截断感过强”。
+
+### 3.7.1 Reader 兼容策略
+
+- 优先使用 `ExcelReader`（如果当前环境可用）
+- 若不可用，自动使用 fallback（`openpyxl`）逐行读取
+
+### 3.7.2 大表防护（fallback 模式）
+
+通过环境变量限制读取规模：
+
+- `RAG_XLSX_MAX_SHEETS`
+- `RAG_XLSX_MAX_ROWS_PER_SHEET`
+- `RAG_XLSX_MAX_COLS`
+- `RAG_XLSX_MAX_CELL_CHARS`
+
+这样可显著降低单次入库的峰值内存和 embedding 成本。
+
+### 3.7.3 xlsx 文本组织方式
+
+fallback 会把每个 sheet 转成结构化文本：
+
+- 首行标记 `# sheet: <name>`
+- 每行拼接为 `col1 | col2 | ...`
+- 超限内容会截断并标记
+
+这是一种“检索优先”的工程折中：更稳、更可控，语义精度略低于专用表格语义模型。
 
 这是一个典型“按格式定制 chunk 策略”的实践，能平衡召回质量与成本。
 
 ---
 
-## 3.7 异步流程与吞吐控制
+## 3.8 异步流程与吞吐控制
 
 入库流程是异步函数串行处理单文件，chunk 级写入采用批次：
 
@@ -200,6 +251,29 @@ python llama.py chat
 - 每轮任务后 `clear_memory()` 输出 RSS
 
 这是“稳态优先”的策略，易于排障；若追求极致吞吐可再做并发 worker 化。
+
+---
+
+## 3.9 Query/Chat 检索与输出策略
+
+Query 与 Chat 支持独立 topK：
+
+- `RAG_QUERY_TOP_K`
+- `RAG_CHAT_TOP_K`
+
+来源片段打印控制：
+
+- `RAG_QUERY_SHOW_SOURCES`
+- `RAG_QUERY_MAX_SOURCE_NODES`
+- `RAG_QUERY_SOURCE_MAX_CHARS`
+- `RAG_QUERY_FULL_OUTPUT`
+
+当 `RAG_QUERY_FULL_OUTPUT=1` 或命令行使用 `--full` 时：
+
+- 打印所有 source nodes
+- 不截断 source 文本
+
+适用于调试“是否真正召回到 xlsx / docx / pdf 具体片段”。
 
 ---
 
@@ -256,6 +330,22 @@ python llama.py chat
 
 - `reader`
 - `split`（transformations 列表）
+
+### Q5: 为什么 `xlsx` 显示 unsupported？
+
+通常是当前环境未加载到 `ExcelReader`。本项目已内置 fallback：
+
+- 若 `ExcelReader` 不可用，会自动尝试 `openpyxl` 读取
+- 若仍失败，检查 `openpyxl` / `pandas` 是否安装、文件是否损坏
+
+### Q6: 为什么聊天里看起来“输出不完整”？
+
+有两层截断：
+
+1. 展示截断（`RAG_QUERY_SOURCE_MAX_CHARS`）  
+2. xlsx fallback 的单元格截断（`RAG_XLSX_MAX_CELL_CHARS`）
+
+可通过 `--full` 或 `RAG_QUERY_FULL_OUTPUT=1` 做完整来源输出调试。
 
 ---
 
